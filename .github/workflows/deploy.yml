@@ -123,6 +123,11 @@ jobs:
               echo "Schema unchanged — skipping migration."
             fi
 
+            # Seed HRM and CRM clients — idempotent (skips existing clients).
+            # Must run after migration so the clients table exists.
+            cd "$RELEASE"
+            node scripts/seed-clients.js
+
             # Atomic symlink swap
             ln -sfn "$RELEASE" "$APP_DIR/current"
 
