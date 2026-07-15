@@ -1,0 +1,205 @@
+name: CI/CD — Multi-Auth
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: deploy-multiauth
+  cancel-in-progress: true
+
+env:
+  APP_DIR: /opt/multiauth
+  APP_PORT: 5000
+  HC_RETRIES: 5
+  HC_WAIT_SECS: 8      # Node.js starts slower than Python — 40s max
+  HC_TIMEOUT_SECS: 5
+
+jobs:
+
+  deploy:
+    name: Deploy to EC2
+    runs-on: ubuntu-latest
+    environment: production
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Compute SHA256 of schema.prisma BEFORE the push — passed to the server
+      # so it can compare against the previously deployed schema hash and decide
+      # whether prisma migrate deploy needs to run.
+      - name: Compute Prisma schema hash
+        id: schema
+        run: |
+          echo "hash=$(sha256sum prisma/schema.prisma | awk '{print $1}')" >> $GITHUB_OUTPUT
+
+      - name: Prepare SSH key
+        run: |
+          echo "${{ secrets.EC2_SSH_KEY }}" > /tmp/deploy_key
+          chmod 600 /tmp/deploy_key
+
+      # Sync code to server staging area.
+      # node_modules excluded — npm ci on the server installs exact locked deps.
+      # .env excluded — written from secrets on server.
+      - name: Sync code to server
+        run: |
+          rsync -az --delete \
+            -e "ssh -i /tmp/deploy_key -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null" \
+            --exclude='.git' \
+            --exclude='node_modules' \
+            --exclude='.env' \
+            --exclude='keys/*.pem' \
+            . ubuntu@${{ secrets.EC2_HOST }}:/tmp/multiauth-src/
+
+      - name: Deploy on server
+        uses: appleboy/ssh-action@v1.0.3
+        env:
+          DATABASE_URL:      ${{ secrets.DATABASE_URL }}
+          JWT_PRIVATE_KEY:   ${{ secrets.JWT_PRIVATE_KEY }}
+          JWT_PUBLIC_KEY:    ${{ secrets.JWT_PUBLIC_KEY }}
+          HRM_CLIENT_ID:     ${{ secrets.HRM_CLIENT_ID }}
+          HRM_CLIENT_SECRET: ${{ secrets.HRM_CLIENT_SECRET }}
+          CRM_CLIENT_ID:     ${{ secrets.CRM_CLIENT_ID }}
+          CRM_CLIENT_SECRET: ${{ secrets.CRM_CLIENT_SECRET }}
+          CORS_ORIGIN:       ${{ secrets.CORS_ORIGIN }}
+          SCHEMA_HASH:       ${{ steps.schema.outputs.hash }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: DATABASE_URL,JWT_PRIVATE_KEY,JWT_PUBLIC_KEY,HRM_CLIENT_ID,HRM_CLIENT_SECRET,CRM_CLIENT_ID,CRM_CLIENT_SECRET,CORS_ORIGIN,SCHEMA_HASH
+          script_stop: true
+          script: |
+            set -euo pipefail
+
+            APP_DIR=/opt/multiauth
+            TIMESTAMP=$(date +%Y%m%d%H%M%S)
+            RELEASE=$APP_DIR/releases/$TIMESTAMP
+
+            # Record current release for rollback
+            if [ -L $APP_DIR/current ]; then
+              readlink $APP_DIR/current > /tmp/multiauth_prev_release
+            fi
+
+            # Create release
+            mkdir -p "$RELEASE"
+            cp -r /tmp/multiauth-src/. "$RELEASE/"
+            rm -rf /tmp/multiauth-src
+
+            # Write .env from GitHub Secrets — printf safely handles special chars.
+            # RSA keys are stored as single-line strings with literal \n in GitHub Secrets.
+            {
+              printf 'DATABASE_URL=%s\n'      "$DATABASE_URL"
+              printf 'JWT_PRIVATE_KEY=%s\n'   "$JWT_PRIVATE_KEY"
+              printf 'JWT_PUBLIC_KEY=%s\n'    "$JWT_PUBLIC_KEY"
+              printf 'HRM_CLIENT_ID=%s\n'     "$HRM_CLIENT_ID"
+              printf 'HRM_CLIENT_SECRET=%s\n' "$HRM_CLIENT_SECRET"
+              printf 'CRM_CLIENT_ID=%s\n'     "$CRM_CLIENT_ID"
+              printf 'CRM_CLIENT_SECRET=%s\n' "$CRM_CLIENT_SECRET"
+              printf 'CORS_ORIGIN=%s\n'       "$CORS_ORIGIN"
+              printf 'PORT=5000\n'
+              printf 'NODE_ENV=production\n'
+            } > "$RELEASE/.env"
+            chmod 600 "$RELEASE/.env"
+
+            # Install exact production deps from lockfile — no version drift
+            cd "$RELEASE"
+            npm ci --omit=dev
+
+            # Generate Prisma client for current Node/OS environment.
+            # Always required — client is not committed to the repo.
+            npx prisma generate
+
+            # Migration safety: only run migrate deploy if schema.prisma changed.
+            # If it fails here, the deploy aborts BEFORE PM2 is reloaded —
+            # the running app stays up against the last known-good schema.
+            PREV_HASH=$(cat /tmp/multiauth_schema_hash 2>/dev/null || echo "none")
+            if [ "$SCHEMA_HASH" != "$PREV_HASH" ]; then
+              echo "Schema changed ($PREV_HASH → $SCHEMA_HASH) — running prisma migrate deploy..."
+              npx prisma migrate deploy
+              echo "$SCHEMA_HASH" > /tmp/multiauth_schema_hash
+            else
+              echo "Schema unchanged — skipping migration."
+            fi
+
+            # Atomic symlink swap
+            ln -sfn "$RELEASE" "$APP_DIR/current"
+
+            # Zero-downtime reload via PM2:
+            # pm2 reload starts a new process, waits for it to be ready,
+            # then kills the old one — no dropped connections.
+            if pm2 describe multiauth > /dev/null 2>&1; then
+              pm2 reload "$APP_DIR/current/pm2.config.js" --update-env
+            else
+              cd "$APP_DIR/current"
+              pm2 start pm2.config.js
+              pm2 save
+            fi
+
+            # Keep only last 5 releases — avoid filling the 20 GB disk
+            ls -dt "$APP_DIR/releases"/*/ 2>/dev/null | tail -n +6 | xargs rm -rf || true
+
+            echo "Deployed: $RELEASE"
+
+      - name: Health check
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -euo pipefail
+            RETRIES=${{ env.HC_RETRIES }}
+            WAIT=${{ env.HC_WAIT_SECS }}
+            TIMEOUT=${{ env.HC_TIMEOUT_SECS }}
+
+            for i in $(seq 1 $RETRIES); do
+              echo "Health check attempt $i/$RETRIES..."
+              HTTP=$(curl -sf -o /dev/null -w '%{http_code}' \
+                --max-time $TIMEOUT http://localhost:${{ env.APP_PORT }}/ \
+                2>/dev/null || echo "000")
+              echo "  HTTP $HTTP"
+              [ "$HTTP" = "200" ] && { echo "Healthy."; exit 0; }
+              [ "$i" -lt "$RETRIES" ] && sleep "$WAIT"
+            done
+
+            echo "Health check FAILED after $RETRIES attempts." >&2
+            exit 1
+
+      - name: Rollback on failure
+        if: failure()
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ubuntu
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script: |
+            echo "Rollback triggered..."
+            if [ -f /tmp/multiauth_prev_release ]; then
+              PREV=$(cat /tmp/multiauth_prev_release)
+              if [ -d "$PREV" ]; then
+                echo "Rolling back to: $PREV"
+                ln -sfn "$PREV" /opt/multiauth/current
+                pm2 reload "$PREV/pm2.config.js" --update-env \
+                  || pm2 restart multiauth
+                echo "Rollback complete."
+              else
+                echo "Previous release not found: $PREV"
+              fi
+            else
+              echo "No previous release recorded (first deploy failed)."
+            fi
+
+# ── Required GitHub Secrets (set at repo Settings → Secrets → Actions) ───────
+# EC2_HOST          : EC2 public IP from CFT output PublicIP
+# EC2_SSH_KEY       : Contents of your .pem private key file
+# DATABASE_URL      : postgresql://postgres:PASSWORD@RDS_HOST:5432/multiauth_db
+# JWT_PRIVATE_KEY   : RSA private key as single-line string (\\n for newlines)
+# JWT_PUBLIC_KEY    : RSA public key as single-line string (\\n for newlines)
+# HRM_CLIENT_ID     : HRM OAuth client ID
+# HRM_CLIENT_SECRET : HRM OAuth secret
+# CRM_CLIENT_ID     : CRM OAuth client ID
+# CRM_CLIENT_SECRET : CRM OAuth secret
+# CORS_ORIGIN       : e.g. https://app.YOUR_IP.nip.io
